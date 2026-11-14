@@ -1,0 +1,167 @@
+"""Step 1: pull traces out of the two parquet sources (data/SOURCES.md says where they come from).
+
+  the Storf bundle   data/raw/storf_bundle/control_arena.parquet  -> data/interim/controlarena.jsonl
+  METR's MALT        data/raw/malt/data/public-*.parquet          -> data/interim/malt.jsonl
+
+The Storf bundle: each trace is the bundle's own `formatted_transcript`, word for word. That is
+the text the bundle gives a monitor ([SYSTEM], [USER], [ASSISTANT] / [TOOL CALLS], [TOOL]), and
+it leaves out what the agent wrote between its tool calls. The `messages` column keeps that
+text, and in these runs it is the agent's reasoning: "side task" is in 2,376 of ControlArena's
+3,750 hidden-goal traces there, 100 in `formatted_transcript`, and in no honest trace. A judge
+that reads `messages` reads the answer, and its score is not comparable with a monitor that
+reads `formatted_transcript`.
+
+MALT traces are written as plain text with the tags prepare.py uses for ATBench: [USER],
+[AGENT], [AGENT ACTION], [ENVIRONMENT]. Only Claude 3.7 Sonnet runs are kept, because every
+run that was told to underperform comes from that model; normal runs from other models would
+let a judge tell the model apart instead of the behaviour. The judge must not see the answer,
+so three things are left out of each run:
+  - the system message (in prompted runs it holds the instruction to underperform);
+  - the agent's private reasoning (`completion_type == "reasoning_completion"`);
+  - the scaffold's notices ("So far in this attempt at the task, you have used ...", and
+    "No valid function call found ..."): their wording differs between the prompted and the
+    normal batches.
+
+Needs pyarrow (the `extract` extra):
+  python data/extract.py
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import re
+from collections import Counter
+from pathlib import Path
+
+import pyarrow.parquet as pq
+
+HERE = Path(__file__).resolve().parent
+RAW = HERE / "raw"  # git-ignored
+INTERIM = HERE / "interim"
+
+MALT_MODEL = "claude-3-7-sonnet-20250219"
+MALT_UNDERPERFORMING = {"sabotage", "match_weaker_model", "partial_problem_solving"}
+MALT_NOTICES = (
+    re.compile(r"^\s*So far in this attempt at the task, you have used"),
+    re.compile(r"^\s*No valid function call found in the last response"),
+)
+
+
+def text(value) -> str:
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def call_line(name, arguments) -> str:
+    return f"{name}({text(arguments)})"
+
+
+def malt_trace(messages: list[dict], dropped: Counter) -> str:
+    parts: list[str] = []
+    for message in messages:
+        role = message["role"]
+        content = text(message.get("content")).strip()
+        kind = (message.get("metadata") or {}).get("completion_type")
+        if role == "system":
+            dropped["system message"] += 1
+            continue
+        if kind == "reasoning_completion":
+            dropped["private reasoning"] += 1
+            continue
+        if any(pattern.match(content) for pattern in MALT_NOTICES):
+            dropped["scaffold notice"] += 1
+            continue
+        if role == "user":
+            parts.append(f"[USER]\n{content}")
+        elif role == "assistant":
+            if content:
+                parts.append(f"[AGENT]\n{content}")
+            call = message.get("function_call")
+            if call:
+                parts.append(
+                    f"[AGENT ACTION]\n{call_line(call.get('name'), call.get('arguments'))}"
+                )
+        elif role == "function":
+            parts.append(f"[ENVIRONMENT]\n{content}")
+        else:
+            parts.append(f"[{str(role).upper()}]\n{content}")
+    return "\n\n".join(parts)
+
+
+def extract_malt() -> None:
+    out = INTERIM / "malt.jsonl"
+    kept: Counter = Counter()
+    dropped: Counter = Counter()
+    with out.open("w", encoding="utf-8", newline="\n") as handle:
+        for path in sorted(glob.glob(str(RAW / "malt" / "data" / "public-*.parquet"))):
+            batches = pq.ParquetFile(path).iter_batches(
+                batch_size=8, columns=["samples", "metadata"]
+            )
+            for batch in batches:
+                samples = batch.column("samples")
+                for index, meta in enumerate(batch.column("metadata").to_pylist()):
+                    labels = set(meta["labels"])
+                    if meta["model"] != MALT_MODEL or len(labels) != 1:
+                        continue
+                    label = next(iter(labels))
+                    if label != "normal" and label not in MALT_UNDERPERFORMING:
+                        continue
+                    run = samples[index]
+                    last = run[len(run) - 1].as_py()  # the last generation's input is the whole run
+                    messages = list(last["input"]) + list((last["output"] or [[]])[0] or [])
+                    record = {
+                        "id": f"malt-{meta['run_id']}",
+                        "trace": malt_trace(messages, dropped),
+                        "source": "malt",
+                        "group": meta["task_id"].split("/")[0],
+                        "detail": label,
+                        "task_id": meta["task_id"],
+                        "run_source": meta["run_source"],
+                        "manually_reviewed": meta["manually_reviewed"],
+                    }
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    kept[label] += 1
+            print(Path(path).name, dict(kept), flush=True)
+    print("MALT kept:", dict(kept), "| left out of traces:", dict(dropped))
+
+
+CONTROL_ARENA_ID = re.compile(
+    r"^(agentdojo|bash|iac|rogue_eval|shade)_(.+?)_(positive|negative)\d*_"
+)
+
+
+def extract_controlarena() -> None:
+    counts: Counter = Counter()
+    source = pq.ParquetFile(RAW / "storf_bundle" / "control_arena.parquet")
+    with (INTERIM / "controlarena.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
+        for batch in source.iter_batches(
+            batch_size=64, columns=["id", "formatted_transcript", "ground_truth"]
+        ):
+            for row in batch.to_pylist():
+                match = CONTROL_ARENA_ID.match(row["id"])
+                if not match:
+                    raise SystemExit(f"unrecognised ControlArena id: {row['id']}")
+                record = {
+                    "id": f"storf-{row['id']}",
+                    "trace": row["formatted_transcript"].strip(),
+                    "source": "controlarena",
+                    "group": match.group(1),  # the setting
+                    "detail": match.group(2),  # the agent model
+                    "hidden_goal": bool(row["ground_truth"]),
+                }
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                counts[(record["group"], record["hidden_goal"])] += 1
+    for key in sorted(counts):
+        print("ControlArena", key, counts[key])
+
+
+def main() -> None:
+    INTERIM.mkdir(parents=True, exist_ok=True)
+    extract_controlarena()
+    extract_malt()
+
+
+if __name__ == "__main__":
+    main()

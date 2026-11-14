@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env
+
+# The datasets, the traces made from them and the per-trace scores stay out of the repository:
+# one source is for research use only and may not be passed on. results/ holds numbers only.
+data/raw/
+data/interim/
+data/prepared/
+data/scores/
+data/jobs.json

@@ -1,0 +1,36 @@
+[project]
+name = "agent-safety-judges"
+version = "0.1.0"
+description = "How well a decision model judges agent traces for safety, with no tuning"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+  # The commit judge/launch.py installs in a job. It has the change that lets clef-tune read
+  # prompts longer than 16,384 tokens; tests/test_launch.py checks the two pins agree.
+  "clef-tune @ git+https://github.com/hersh-gupta/clef-tune@15ee6a6343f31b145cb77d6dff93ce8876877df7",
+  "huggingface_hub>=1.33,<2",
+  "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+extract = ["pyarrow>=17"]  # data/extract.py reads the parquet sources
+baselines = ["scikit-learn>=1.5"]  # analysis/baselines.py
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.urls]
+Source = "https://github.com/hersh-gupta/agent-safety-judges"
+
+[tool.uv]
+package = false  # scripts, not an installable package
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
